@@ -6,63 +6,27 @@
 #include <Windows.h>
 #include <queue>
 
-#include "WriteLogTXT.h"
-#include "RingBuffer.h"
+#include "SendPacket.h"
+#include "Session.h"
 #include "PacketDefine.h"
-#include "NetworkPacket.h"
+#include "WriteLogTXT.h"
+#include "PrintStackInfo.h"
+
+#include "Proxy.h"
+#include "Stub.h"
+#include "StubHandler.h"
 
 using namespace std;
 
+// Select Model은 기본적으로 set당 최대 64개의 소켓을 검사 가능.
+
 #define SERVER_PORT 5000
 
+// Content에 접속 가능한 유저 수
 #define TOTAL_PLAYER 60
 #define HEADER_SIZE 3
 
-// PLAYER LIST에서 해당 공간의 상태.
-// 사용가능, 연결됨, 삭제예정
-enum PS_Status
-{
-	// player status
-	PS_EMPTY = 0, PS_VALID, PS_INVALID,
-};
-enum Player_Action
-{
-	ACT_IDLE, ACT_MOVESTART, ACT_MOVING, ACT_ATT1, ACT_ATT2, ACT_ATT3
-};
-
-struct Player
-{
-	// list 공간 상태
-	PS_Status _status;
-	// 패킷 작업 지점.
-	BOOL _is_payload; // payload 작업중
-	int _h_type;
-
-	
-	MyRingBuffer _recvBuf;
-	MyRingBuffer _sendBuf;
-
-	SOCKET sock;
-	SOCKADDR_IN addr;
-	ULONGLONG _tStamp;
-	int _id;
-
-	Player_Action _act;
-	BYTE _dir;
-	BYTE _hp;
-	int _y;
-	int _x;
-};
-
-// PLAYER LIST에서 삭제할 멤버 ID
-struct DeleteJob
-{
-	int _id;
-};
-
 // DATA
-Player g_Members[TOTAL_PLAYER];
-queue<DeleteJob> g_DeleteQueue;
 int g_numMembers; // 접속자 수
 
 //FPS (안쓸듯)
@@ -78,22 +42,16 @@ int g_num_packet;
 
 void Init();
 bool Update(SOCKET& listenSock);
-void SendUnicast(FD_SET& wset, int id, char* packet, int len);
-void SendBroadcast(FD_SET& wset, int id, char* packet, int len);
-void DeleteSockets(FD_SET& wset);
+void DeleteSockets();
 
-void MoveStart(FD_SET& wset, int id, ClientRequestMoveStart* packet);
-void MoveStop(FD_SET& wset, int id, ClientRequestMoveStop* packet);
-void Attack1(FD_SET& wset, int id, ClientRequestAtt1* packet);
-void Attack2(FD_SET& wset, int id, ClientRequestAtt2* packet);
-void Attack3(FD_SET& wset, int id, ClientRequestAtt3* packet);
-
-void UpdateLogic(FD_SET& wset);
+void UpdateLogic();
 void MovingUpdate(int id);
-void Att1Update(FD_SET& wset, int id);
+void Att1Update(int id);
+void Att2Update(int id);
+void Att3Update(int id);
 
 int SetId();
-void PlayerIsJoined(FD_SET& wset, SOCKET& clientSock, SOCKADDR_IN& clientAddr);
+void PlayerIsJoined(SOCKET& clientSock, SOCKADDR_IN& clientAddr);
 
 void main(void)
 {
@@ -119,6 +77,7 @@ void main(void)
 		return;
 	}
 
+	// 0.0.0.0:5000 에 대해 Listen 
 	SOCKADDR_IN serveraddr;
 	ZeroMemory(&serveraddr, sizeof serveraddr);
 	serveraddr.sin_family = AF_INET;
@@ -175,7 +134,7 @@ void main(void)
 		if (!Update(listen_sock))
 			break;
 
-		//50 fps 고정
+		//50 fps 제한
 		delta_time = timeGetTime() - old_time;
 		sleep_time = 20 - delta_time;
 		if (sleep_time > 0)
@@ -269,7 +228,7 @@ bool Update(SOCKET& listenSock)
 			return false;
 		}
 
-		PlayerIsJoined(wset, client_sock, clientaddr);
+		PlayerIsJoined(client_sock, clientaddr);
 	}
 
 	//////////////////////////////////////////////////////
@@ -280,230 +239,178 @@ bool Update(SOCKET& listenSock)
 		// 밀고있지 않으므로 소켓 번호가 겹칠수있음.
 		if (g_Members[i]._status == PS_VALID && FD_ISSET(g_Members[i].sock, &rset))
 		{
-			char temp_buf[MAX_RINGBUF_SIZE];
-			int recv_cap = g_Members[i]._recvBuf.GetCapacity();
-			//////////////////////////////////////////////////////
-			// TCP 버퍼 -> Temp (recv_cap 0 들어가도 문제없음)
-			//////////////////////////////////////////////////////
-			retval = recv(g_Members[i].sock, temp_buf, recv_cap, 0);
-			g_num_packet++;
+			int now_cap = g_Members[i]._recvBuf.GetCapacity();
+			int num_direct_enq = g_Members[i]._recvBuf.DirectEnqueueSize();
+			////////////////////////////////////////////////////////////////
+			// 1. 남는 공간이 없으면 Recv하지 않음.
+			////////////////////////////////////////////////////////////////
+			if (now_cap < 1)
+			{
+				continue;
+			}
+			////////////////////////////////////////////////////////////////
+			// 2. Select된 소켓이므로 Recv시도.
+			////////////////////////////////////////////////////////////////
+			retval = recv(g_Members[i].sock
+				, g_Members[i]._recvBuf.GetHeadPtr()
+				, num_direct_enq
+				, 0);
 			if (retval == SOCKET_ERROR)
 			{
+				// RST (disconnect)
 				if (GetLastError() == 10054)
 				{
-					// RST (disconnect)
+
 				}
+				// 예상하지 못한 오류
 				else
 				{
-					// 로깅
 					char err_buff[100];
 					sprintf_s(err_buff, sizeof err_buff, "Recv()에서 알 수 없는 에러.\n ERRORCODE : %d", GetLastError());
 					cout << "이상에러" << endl;
 					WriteLog(err_buff, "Recv Error");
 				}
+
 				g_Members[i]._status = PS_INVALID;
 				g_DeleteQueue.push(DeleteJob{ g_Members[i]._id });
+				continue;
 			}
+			// FIN (disconnect)
 			else if (retval == 0)
 			{
-				// FIN (disconnect)
 				g_Members[i]._status = PS_INVALID;
 				g_DeleteQueue.push(DeleteJob{ g_Members[i]._id });
+				continue;
 			}
+			// 정상 동작
 			else
 			{
-				//////////////////////////////////////////////////////
-				// Temp -> RecvRingBuf
-				//////////////////////////////////////////////////////
-				int num_enq = g_Members[i]._recvBuf.Enqueue(temp_buf, retval);
-				if (num_enq != retval)
+				g_Members[i]._recvBuf.MoveTail(retval);
+				g_Members[i]._recvBuf._dataSize += retval;
+			}
+			////////////////////////////////////////////////////////////////////////////
+			// 3. ringbuffer를 direct 끝까지 채움, 링버퍼가 꽉 차지 않음.
+			////////////////////////////////////////////////////////////////////////////
+			if (retval == num_direct_enq && !g_Members[i]._recvBuf.IsFull())
+			{
+				//cout << "recv버퍼 한바퀴 돌았음. " << endl;
+				//cout << "retval == num direct enqsize :" << retval << endl;
+				//cout << "Head : " << g_Members[i]._recvBuf._head << endl;
+				//cout << "Tail : " << g_Members[i]._recvBuf._tail << endl;
+				//cout << endl;
+				retval = recv(g_Members[i].sock
+					, g_Members[i]._recvBuf.GetTailPtr()
+					, g_Members[i]._recvBuf.DirectEnqueueSize()
+					, 0);
+				if (retval == SOCKET_ERROR && GetLastError() == WSAEWOULDBLOCK)
 				{
-					// 로깅
+					// recv할 내용이 없음.
+				}
+				else if (retval == SOCKET_ERROR)
+				{
+					// RST (disconnect)
+					if (GetLastError() == 10054)
+					{
+						
+					}
+					// 예상하지 못한 오류
+					else
+					{
+						char err_buff[100];
+						sprintf_s(err_buff, sizeof err_buff, "Recv()에서 알 수 없는 에러.\n ERRORCODE : %d", GetLastError());
+						cout << "이상에러" << endl;
+						WriteLog(err_buff, "Recv Error");
+					}
+
+					g_Members[i]._status = PS_INVALID;
+					g_DeleteQueue.push(DeleteJob{ g_Members[i]._id });
+					continue;
+				}
+				// FIN (disconnect)
+				else if (retval == 0)
+				{
+					g_Members[i]._status = PS_INVALID;
+					g_DeleteQueue.push(DeleteJob{ g_Members[i]._id });
+					continue;
+				}
+				// 정상 동작
+				else
+				{
+					g_Members[i]._recvBuf.MoveTail(retval);
+					g_Members[i]._recvBuf._dataSize += retval;
+				}
+
+				cout << "추가 데이터 삽입 " << endl;
+				cout << "retval : " << retval << endl;
+				cout << "Head : " << g_Members[i]._recvBuf._head << endl;
+				cout << "Tail : " << g_Members[i]._recvBuf._tail << endl;
+				cout << endl;
+			}
+
+			g_num_packet++;
+			
+			//////////////////////////////////////////////////////
+			// 수신버퍼에 있는 패킷 처리
+			//////////////////////////////////////////////////////
+			char ip_buffer[20];
+			while (1)
+			{
+				Header h;
+				int num_deq;
+
+				//////////////////////////////////////////////////////
+				// Header 검사
+				//////////////////////////////////////////////////////
+				// 헤더작업
+				if (g_Members[i]._recvBuf.GetDataSize() < sizeof Header)
+					break;
+
+				num_deq = g_Members[i]._recvBuf.Peek((char*)&h, sizeof Header);
+				if (num_deq != sizeof Header)
+				{
+					// 링버퍼 문제 로깅
 					char err_buff[100];
-					sprintf_s(err_buff, sizeof err_buff, "RecvBuf.Enqueue() 동작 에러.");
+					sprintf_s(err_buff, sizeof err_buff, "RecvBuf.Dequeue() 동작 에러.");
 					WriteLog(err_buff);
 
 					return false;
 				}
 
-				//////////////////////////////////////////////////////
-				// 수신버퍼에 있는 패킷 처리
-				//////////////////////////////////////////////////////
-				char ip_buffer[20];
-				while (1)
+				// 적합한 헤더인가?
+				if (h.byCode != 0x89 || h.bySize > MAX_PAYLOAD_SIZE)
 				{
-					Header h;
-					int num_deq;
-					
-					//////////////////////////////////////////////////////
-					// 헤더
-					//////////////////////////////////////////////////////
-					if (g_Members[i]._is_payload == false)
-					{
-						// 헤더작업
-						if (g_Members[i]._recvBuf.GetDataSize() < sizeof Header)
-							break;
+					// 헤더 이상
+					InetNtopA(AF_INET, &g_Members[i].addr.sin_addr, ip_buffer, sizeof ip_buffer);
+					cout << "[Abnormal] " << ip_buffer << ":" << ntohs(g_Members[i].addr.sin_port) <<
+						"Header, byCode : " << h.byCode << "bySize : " << h.bySize << endl << endl;
 
-						int num_deq;
-						num_deq = g_Members[i]._recvBuf.Dequeue((char*)&h, sizeof Header);
-						if (num_deq != sizeof Header)
-						{
-							// 링버퍼 문제 로깅
-							char err_buff[100];
-							sprintf_s(err_buff, sizeof err_buff, "RecvBuf.Dequeue() 동작 에러.");
-							WriteLog(err_buff);
-
-							return false;
-						}
-
-						if (h.byCode != 0x89 || h.bySize > MAX_PAYLOAD_SIZE)
-						{
-							// 헤더 이상
-							InetNtopA(AF_INET, &g_Members[i].addr.sin_addr, ip_buffer, sizeof ip_buffer);
-							cout << "[Abnormal] " << ip_buffer << ":" << ntohs(g_Members[i].addr.sin_port) <<
-								"Header, byCode : " << h.byCode << "bySize : " << h.bySize << endl << endl;
-							
-							g_Members[i]._status = PS_INVALID;
-							g_DeleteQueue.push(DeleteJob{ g_Members[i]._id });
-							break;
-						}
-
-						g_Members[i]._is_payload = true;
-						g_Members[i]._h_type = h.byType;
-					}
-					
-					//////////////////////////////////////////////////////
-					// PAYLOAD
-					//////////////////////////////////////////////////////
-
-					BYTE type = g_Members[i]._h_type;
-					bool is_waiting_payload = false;
-					char payload[MAX_PAYLOAD_SIZE];
-
-					switch (type)
-					{
-					case dfPACKET_CS_MOVE_START:
-						if (g_Members[i]._recvBuf.GetDataSize() < sizeof ClientRequestMoveStart)
-						{
-							is_waiting_payload = true;
-							break;
-						}
-						ClientRequestMoveStart req_mstrt;
-						num_deq = g_Members[i]._recvBuf.Dequeue((char*)&req_mstrt, sizeof ClientRequestMoveStart);
-						if (num_deq != sizeof ClientRequestMoveStart)
-						{
-							// 링버퍼 문제 로깅
-							char err_buff[100];
-							sprintf_s(err_buff, sizeof err_buff, "RecvBuf.Dequeue() 동작 에러.");
-							WriteLog(err_buff);
-
-							return false;
-						}
-						MoveStart(wset, i, &req_mstrt);
-
-						g_Members[i]._is_payload = false;
-						break;
-					case dfPACKET_CS_MOVE_STOP:
-						if (g_Members[i]._recvBuf.GetDataSize() < sizeof ClientRequestMoveStop)
-						{
-							is_waiting_payload = true;
-							break;
-						}
-						ClientRequestMoveStop req_mstp;
-						num_deq = g_Members[i]._recvBuf.Dequeue((char*)&req_mstp, sizeof ClientRequestMoveStop);
-						if (num_deq != sizeof ClientRequestMoveStop)
-						{
-							// 링버퍼 문제 로깅
-							char err_buff[100];
-							sprintf_s(err_buff, sizeof err_buff, "RecvBuf.Dequeue() 동작 에러.");
-							WriteLog(err_buff);
-
-							return false;
-						}
-						MoveStop(wset, i, &req_mstp);
-
-						g_Members[i]._is_payload = false;
-						break;
-					case dfPACKET_CS_ATTACK1:
-						if (g_Members[i]._recvBuf.GetDataSize() < sizeof ClientRequestAtt1)
-						{
-							is_waiting_payload = true;
-							break;
-						}
-						ClientRequestAtt1 req_att1;
-						num_deq = g_Members[i]._recvBuf.Dequeue((char*)&req_att1, sizeof ClientRequestAtt1);
-						if (num_deq != sizeof ClientRequestAtt1)
-						{
-							// 링버퍼 문제 로깅
-							char err_buff[100];
-							sprintf_s(err_buff, sizeof err_buff, "RecvBuf.Dequeue() 동작 에러.");
-							WriteLog(err_buff);
-
-							return false;
-						}
-						Attack1(wset, i, &req_att1);
-
-						g_Members[i]._is_payload = false;
-						break;
-					case dfPACKET_CS_ATTACK2:
-						if (g_Members[i]._recvBuf.GetDataSize() < sizeof ClientRequestAtt2)
-						{
-							is_waiting_payload = true;
-							break;
-						}
-						ClientRequestAtt2 req_att2;
-						num_deq = g_Members[i]._recvBuf.Dequeue((char*)&req_att2, sizeof ClientRequestAtt2);
-						if (num_deq != sizeof ClientRequestAtt2)
-						{
-							// 링버퍼 문제 로깅
-							char err_buff[100];
-							sprintf_s(err_buff, sizeof err_buff, "RecvBuf.Dequeue() 동작 에러.");
-							WriteLog(err_buff);
-
-							return false;
-						}
-						Attack2(wset, i, &req_att2);
-
-						g_Members[i]._is_payload = false;
-						break;
-					case dfPACKET_CS_ATTACK3:
-						if (g_Members[i]._recvBuf.GetDataSize() < sizeof ClientRequestAtt3)
-						{
-							is_waiting_payload = true;
-							break;
-						}
-						ClientRequestAtt3 req_att3;
-						num_deq = g_Members[i]._recvBuf.Dequeue((char*)&req_att3, sizeof ClientRequestAtt3);
-						if (num_deq != sizeof ClientRequestAtt3)
-						{
-							// 링버퍼 문제 로깅
-							char err_buff[100];
-							sprintf_s(err_buff, sizeof err_buff, "RecvBuf.Dequeue() 동작 에러.");
-							WriteLog(err_buff);
-
-							return false;
-						}
-						Attack3(wset, i, &req_att3);
-
-						g_Members[i]._is_payload = false;
-						break;
-					default:
-						// 패킷 이상
-						g_Members[i]._status = PS_INVALID;
-						g_DeleteQueue.push(DeleteJob{ g_Members[i]._id });
-						break;
-					}
-
-					if (is_waiting_payload == true)
-					{
-						break;
-					}
-					else
-					{
-						g_Members[i]._is_payload = false;
-					}
-
+					g_Members[i]._status = PS_INVALID;
+					g_DeleteQueue.push(DeleteJob{ g_Members[i]._id });
+					break;
 				}
+
+				// payload가 전부 버퍼에 있나?
+				if (g_Members[i]._recvBuf.GetDataSize() < sizeof Header + h.bySize)
+					break;
+
+				//////////////////////////////////////////////////////
+				// PAYLOAD
+				//////////////////////////////////////////////////////
+
+				// PacketProcedure(Ringbuf& rb);
+
+				// 1. Header와 payload를 나눈다.
+				// Header, SerializingBuffer.PutData <- Ringbuf.Dequeue
+
+				// 2. 매개변수 (char*, list<>&는 동적할당?) -> 일단 동적할당.
+				// 3. 원시타입은 그냥 sb에서 빼면됨.
+				// 4. 동일한 시그니쳐를 호출시킴
+				// 5. 해당 시그니쳐를 구현한 실제 iStub recv_stb = new Stub에 대한 stb.Mk_packet(...);을 호출
+						
+				StubHandler handle;
+				handle._now_id = i;
+				Stub::RPC_PacketProcedure(i, &handle);
+				
 			}
 		}
 	}
@@ -511,12 +418,12 @@ bool Update(SOCKET& listenSock)
 	//////////////////////////////////////////////////////
 	// Logic
 	////////////////////////////////////////////////////// 
-	UpdateLogic(wset);
+	UpdateLogic();
 
 	//////////////////////////////////////////////////////
 	// Delete
 	//////////////////////////////////////////////////////
-	DeleteSockets(wset);
+	DeleteSockets();
 	
 	//////////////////////////////////////////////////////
 	// SEND Select
@@ -553,38 +460,58 @@ bool Update(SOCKET& listenSock)
 		if (g_Members[i]._status == PS_VALID && FD_ISSET(g_Members[i].sock, &wset))
 		{
 			int retval;
-			char send_buf[MAX_RINGBUF_SIZE];
-			int num_deq = g_Members[i]._sendBuf.GetDataSize();
-			if (g_Members[i]._sendBuf.Dequeue(send_buf, num_deq) != num_deq)
-			{
-				// 로깅
-				char err_buff[100];
-				sprintf_s(err_buff, sizeof err_buff, "SendBuf.Enqueue() 동작 에러.");
-				WriteLog(err_buff);
-
-				return false;
-			}
-
-			retval = send(g_Members[i].sock, send_buf, num_deq, 0);
+			
+			// 1. send를 시도
+			retval = send(g_Members[i].sock
+				, g_Members[i]._sendBuf.GetHeadPtr()
+				, g_Members[i]._sendBuf.DirectDequeueSize()
+				, 0);			
 			if (retval == SOCKET_ERROR)
 			{
+				//select되었기 때문에 버퍼가 꽉 차 wouldblock 걸릴 일이 없다.
+
 				int send_error = GetLastError();
+
+				// RST (disconnect) WSAECONNRESET (10054)
+				if (send_error == WSAECONNRESET)
+				{
+					
+				}
+				// 예상하지 못한 오류
+				else
+				{
+					char err_buff[100];
+					sprintf_s(err_buff, sizeof err_buff, "Recv()에서 알 수 없는 에러.\n ERRORCODE : %d", GetLastError());
+					cout << "이상에러" << endl;
+					WriteLog(err_buff, "Recv Error");
+				}
+
 				if (g_Members[i]._status == PS_VALID)
 				{
 					g_Members[i]._status = PS_INVALID;
 					g_DeleteQueue.push(DeleteJob{ i });
 				}
+				continue;
 				// SEND시도, 연결 끊어지면 CLOSESOCKET QUEUEING
 			}
+
+			// 2. directsize만큼 한번만 전송. 나머지는 다음 프레임에 전송
+			g_Members[i]._sendBuf._dataSize -= retval;
+			g_Members[i]._sendBuf.MoveHead(retval);
+
+			// 3. 이번에 전부 보냈으면, clearbuffer로 포인터 초기화.
+			//if (g_Members[i]._sendBuf.IsEmpty())
+			//{
+			//	g_Members[i]._sendBuf.ClearBuffer();
+			//}
 		}
 	}
 	return true;
 }
 
 // 플레이어 참여에 대한 처리
-void PlayerIsJoined(FD_SET& wset, SOCKET& clientSock, SOCKADDR_IN& clientAddr)
+void PlayerIsJoined(SOCKET& clientSock, SOCKADDR_IN& clientAddr)
 {
-	char packet[sizeof(Header) + sizeof(ServerRequestCreatePlayer)];
 	char ip_buffer[20];
 	int id = SetId();
 	if (id == -1)
@@ -600,11 +527,11 @@ void PlayerIsJoined(FD_SET& wset, SOCKET& clientSock, SOCKADDR_IN& clientAddr)
 	g_Members[id]._id = id;
 	g_Members[id]._tStamp = GetTickCount64();
 
-	g_Members[id]._act = ACT_IDLE;
-	g_Members[id]._dir = dfPACKET_MOVE_DIR_LL;
-	g_Members[id]._x = (rand() % (dfRANGE_MOVE_RIGHT - dfRANGE_MOVE_LEFT)) + dfRANGE_MOVE_LEFT;
-	g_Members[id]._y = (rand() % (dfRANGE_MOVE_BOTTOM - dfRANGE_MOVE_TOP)) + dfRANGE_MOVE_TOP;;
-	g_Members[id]._hp = 100;
+	g_Members[id]._player._act = ACT_IDLE;
+	g_Members[id]._player._dir = dfPACKET_MOVE_DIR_LL;
+	g_Members[id]._player._x = (rand() % (dfRANGE_MOVE_RIGHT - dfRANGE_MOVE_LEFT)) + dfRANGE_MOVE_LEFT;
+	g_Members[id]._player._y = (rand() % (dfRANGE_MOVE_BOTTOM - dfRANGE_MOVE_TOP)) + dfRANGE_MOVE_TOP;;
+	g_Members[id]._player._hp = 100;
 	g_Members[id]._is_payload = false;
 	g_numMembers++;
 
@@ -612,63 +539,48 @@ void PlayerIsJoined(FD_SET& wset, SOCKET& clientSock, SOCKADDR_IN& clientAddr)
 	cout << "[CON] " << ip_buffer << ":" << ntohs(g_Members[id].addr.sin_port) <<
 		"님의 접속.(연결중 : " << g_numMembers << ")" << endl << endl;
 
+	Proxy proxy;
 	// 1. client id 할당 및 캐릭터 생성
-	ZeroMemory(packet, sizeof(Header) + sizeof(ServerRequestCreatePlayer));
-	Header* header = (Header*)packet;
-	header->byCode = 0x89;
-	header->bySize = sizeof(ServerRequestCreatePlayer);
-	header->byType = dfPACKET_SC_CREATE_MY_CHARACTER;
-	ServerRequestCreatePlayer* payload = 
-		(ServerRequestCreatePlayer*)(packet + sizeof(Header));
-	payload->_id = id;
-	payload->_dir = g_Members[id]._dir;
-	payload->_hp = g_Members[id]._hp;
-	payload->_x = g_Members[id]._x;
-	payload->_y = g_Members[id]._y;
-	SendUnicast(wset, id, packet, sizeof(Header) + sizeof(ServerRequestCreatePlayer));
+	proxy.ServerReqCreateMyCharacter(id, SENDMODE_UNI,
+		id,
+		g_Members[id]._player._dir,
+		g_Members[id]._player._x,
+		g_Members[id]._player._y,
+		g_Members[id]._player._hp);
+	
 
 	// 2. 다른 참여자에게 해당플레이어 캐릭터 생성
-	header->byType = dfPACKET_SC_CREATE_OTHER_CHARACTER;
-	SendBroadcast(wset, id, packet, sizeof(Header) + sizeof(ServerRequestCreatePlayer));
+	proxy.ServerReqCreateOtherCharacter(id, SENDMODE_BROAD,
+		id,
+		g_Members[id]._player._dir,
+		g_Members[id]._player._x,
+		g_Members[id]._player._y,
+		g_Members[id]._player._hp);
+
 
 	// 여기서 플레이어 상태까지 보내야함.
 	// 3. 접속자에게 내부 인원들에 대한 위치, 상태 전달
 	for (int i = 0;i < TOTAL_PLAYER;i++)
 	{
+		// 현재 존재하거나, 삭제 대기중인 유저.
 		if (g_Members[i]._status != PS_EMPTY && g_Members[i]._id != id)
 		{
-			ZeroMemory(packet, sizeof(Header) + sizeof(ServerRequestCreatePlayer));
-			header = (Header*)packet;
-			header->byCode = 0x89;
-			header->bySize = sizeof(ServerRequestCreatePlayer);
-			header->byType = dfPACKET_SC_CREATE_OTHER_CHARACTER;
-			
-			payload = (ServerRequestCreatePlayer*)(packet + sizeof(Header));
-			payload->_id = g_Members[i]._id;
-			payload->_dir = g_Members[i]._dir;
-			payload->_hp = g_Members[i]._hp;
-			payload->_x = g_Members[i]._x;
-			payload->_y = g_Members[i]._y;
-			SendUnicast(wset, id, packet, sizeof(Header) + sizeof(ServerRequestCreatePlayer));
+			proxy.ServerReqCreateOtherCharacter(id, SENDMODE_UNI,
+				g_Members[i]._id,
+				g_Members[i]._player._dir,
+				g_Members[i]._player._x,
+				g_Members[i]._player._y,
+				g_Members[i]._player._hp);
 
 			// 애니메이션 동기화는 신경쓰지 않는다.
 
-			if (g_Members[i]._act == ACT_MOVING)
+			if (g_Members[i]._player._act == ACT_MOVING)
 			{
-				char packet_move_start[sizeof(Header) + sizeof(ServerRequestMoveStart)];
-				ZeroMemory(packet_move_start, sizeof(Header) + sizeof(ServerRequestMoveStart));
-				header = (Header*)packet_move_start;
-				header->byCode = 0x89;
-				header->bySize = sizeof(ServerRequestMoveStart);
-				header->byType = dfPACKET_SC_MOVE_START;
-
-				ServerRequestMoveStart* payload_move_start;
-				payload_move_start = (ServerRequestMoveStart*)(packet_move_start + sizeof(Header));
-				payload_move_start->_id = g_Members[i]._id;
-				payload_move_start->_dir = g_Members[i]._dir;
-				payload_move_start->_x = g_Members[i]._x;
-				payload_move_start->_y = g_Members[i]._y;
-				SendUnicast(wset, id, packet_move_start, sizeof(Header) + sizeof(ServerRequestMoveStart));
+				proxy.ServerReqMoveStart(id, SENDMODE_UNI,
+					g_Members[i]._id,
+					g_Members[i]._player._dir,
+					g_Members[i]._player._x,
+					g_Members[i]._player._y);
 			}
 		}
 	}
@@ -690,61 +602,12 @@ int SetId()
 	return -1;
 }
 
-// ID에 해당하는 CLIENT에 패킷 전송.
-void SendUnicast(FD_SET& wset, int id, char* packet, int len)
-{
-	int enq_num;
-	enq_num = g_Members[id]._sendBuf.Enqueue(packet, len);
-	if (enq_num == 0)
-	{
-		// send 링버퍼 꽉차면 연결 해제
-		if (g_Members[id]._status == PS_VALID)
-		{
-			g_Members[id]._status = PS_INVALID;
-			g_DeleteQueue.push(DeleteJob{ id });
-		}
-	}
-	else if (enq_num != len)
-	{
-		// 링버퍼 고장
-		char err_buff[100];
-		sprintf_s(err_buff, sizeof err_buff, "SendBuf.Enqueue() 동작 에러.");
-		WriteLog(err_buff);
-	}
-}
-
-// ID에 해당하는 CLINET를 제외한 모두에게 패킷 전송.
-void SendBroadcast(FD_SET& wset, int id, char* packet, int len)
-{
-	for (int i = 0;i < TOTAL_PLAYER;i++)
-	{
-		if (g_Members[i]._status == PS_VALID && g_Members[i]._id != id)
-		{
-			int enq_num;
-			enq_num = g_Members[i]._sendBuf.Enqueue(packet, len);
-			if (enq_num == 0)
-			{
-				// send 링버퍼 꽉차면 연결 해제
-				if (g_Members[i]._status == PS_VALID)
-				{
-					g_Members[i]._status = PS_INVALID;
-					g_DeleteQueue.push(DeleteJob{ i });
-				}
-			}
-			else if (enq_num != len)
-			{
-				// 링버퍼 고장
-				char err_buff[100];
-				sprintf_s(err_buff, sizeof err_buff, "SendBuf.Enqueue() 동작 에러.");
-				WriteLog(err_buff);
-			}
-		}
-	}
-}
-void DeleteSockets(FD_SET& wset)
+void DeleteSockets()
 {
 	// 연결하자마자 끊기면
 	// connect에서 한번, read에서 rst로 또한번
+	Proxy proxy;
+
 	while (!g_DeleteQueue.empty())
 	{
 		char ip_buffer[20];
@@ -763,197 +626,22 @@ void DeleteSockets(FD_SET& wset)
 			"님의 접속 종료. (연결중 : " << g_numMembers << ")" << endl << endl;
 	
 		// 죽은 캐릭터 제거
-		char req_packet[sizeof(Header) + sizeof(DeletePlayer)];
-		ZeroMemory(req_packet, sizeof(Header) + sizeof(DeletePlayer));
-		Header* h = (Header*)req_packet;
-		h->byCode = 0x89;
-		h->bySize = sizeof(dfPACKET_SC_DELETE_CHARACTER);
-		h->byType = dfPACKET_SC_DELETE_CHARACTER;
-		DeletePlayer* payload = (DeletePlayer*)(req_packet + sizeof(Header));
-		payload->_id = id;
-
-		SendUnicast(wset, id, req_packet, sizeof(Header) + sizeof(DeletePlayer));
-		SendBroadcast(wset, id, req_packet, sizeof(Header) + sizeof(DeletePlayer));
-		break;
+		proxy.ServerReqDeleteCharacter(id, SENDMODE_UNI | SENDMODE_BROAD, id);
 	}
 }
 
-void MoveStart(FD_SET& wset, int id, ClientRequestMoveStart* packet)
-{
-	// 1. 움직임 시작.
-	g_Members[id]._act = ACT_MOVESTART;
-	g_Members[id]._dir = packet->_dir;
-	g_Members[id]._x = packet->_x;
-	g_Members[id]._y = packet->_y;
-
-	// 2. broadcast
-	char req_packet[sizeof(Header) + sizeof(ServerRequestMoveStart)];
-	ZeroMemory(req_packet, sizeof(Header) + sizeof(ServerRequestMoveStart));
-	Header* h = (Header*)req_packet;
-	h->byCode = 0x89;
-	h->bySize = sizeof(ServerRequestMoveStart);
-	h->byType = dfPACKET_SC_MOVE_START;
-	ServerRequestMoveStart* payload = (ServerRequestMoveStart*)(req_packet + sizeof(Header));
-	payload->_dir = packet->_dir;
-	payload->_id = id;
-	payload->_x = packet->_x;
-	payload->_y = packet->_y;
-	SendBroadcast(wset, id, req_packet, sizeof(Header) + sizeof(ServerRequestMoveStart));
-}
-
-void MoveStop(FD_SET& wset, int id, ClientRequestMoveStop* packet)
-{
-	// 0. 이상한 방향이면 접속차단
-	if (packet->_dir != dfPACKET_MOVE_DIR_LL && packet->_dir != dfPACKET_MOVE_DIR_RR)
-	{
-		char err_buff[100];
-		sprintf_s(err_buff, sizeof err_buff, "정지상태에서 id : %d님의 방향 이상. (%d).", id, packet->_dir);
-		WriteLog(err_buff);
-
-		if (g_Members[id]._status == PS_VALID)
-		{
-			g_Members[id]._status = PS_INVALID;
-			g_DeleteQueue.push(DeleteJob{ id });
-		}
-		return;
-	}
-	// 1. 움직임 정지.
-	g_Members[id]._act = ACT_IDLE;
-	g_Members[id]._dir = packet->_dir;
-	g_Members[id]._x = packet->_x;
-	g_Members[id]._y = packet->_y;
-
-	// 2. broadcast
-	char req_packet[sizeof(Header) + sizeof(ServerRequestMoveStart)];
-	ZeroMemory(req_packet, sizeof(Header) + sizeof(ServerRequestMoveStart));
-	Header* h = (Header*)req_packet;
-	h->byCode = 0x89;
-	h->bySize = sizeof(ServerRequestMoveStop);
-	h->byType = dfPACKET_SC_MOVE_STOP;
-
-	ServerRequestMoveStop* payload = (ServerRequestMoveStop*)(req_packet + sizeof(Header));
-	payload->_dir = packet->_dir;
-	payload->_id = id;
-	payload->_x = packet->_x;
-	payload->_y = packet->_y;
-	SendBroadcast(wset, id, req_packet, sizeof(Header) + sizeof(ServerRequestMoveStop));
-}
-
-void Attack1(FD_SET& wset, int id, ClientRequestAtt1* packet)
-{
-	// 0. 방향검사
-	if (packet->_dir != dfPACKET_MOVE_DIR_LL && packet->_dir != dfPACKET_MOVE_DIR_RR)
-	{
-		if (g_Members[id]._status == PS_VALID)
-		{
-			g_Members[id]._status = PS_INVALID;
-			g_DeleteQueue.push(DeleteJob{ id });
-		}
-		return;
-	}
-	// 1. 공격요청
-	g_Members[id]._act = ACT_ATT1;
-	g_Members[id]._dir = packet->_dir;
-	g_Members[id]._x = packet->_x;
-	g_Members[id]._y = packet->_y;
-
-	// 2. broadcast
-	char req_packet[sizeof(Header) + sizeof(ServerRequestAtt1)];
-	ZeroMemory(req_packet, sizeof(Header) + sizeof(ServerRequestAtt1));
-	Header* h = (Header*)req_packet;
-	h->byCode = 0x89;
-	h->bySize = sizeof(ServerRequestAtt1);
-	h->byType = dfPACKET_SC_ATTACK1;
-
-	ServerRequestAtt1* payload = (ServerRequestAtt1*)(req_packet + sizeof(Header));
-	payload->_dir = packet->_dir;
-	payload->_id = id;
-	payload->_x = packet->_x;
-	payload->_y = packet->_y;
-	SendBroadcast(wset, id, req_packet, sizeof(Header) + sizeof(ServerRequestAtt1));
-}
-
-void Attack2(FD_SET& wset, int id, ClientRequestAtt2* packet)
-{
-	// 0. 방향검사
-	if (packet->_dir != dfPACKET_MOVE_DIR_LL && packet->_dir != dfPACKET_MOVE_DIR_RR)
-	{
-		if (g_Members[id]._status == PS_VALID)
-		{
-			g_Members[id]._status = PS_INVALID;
-			g_DeleteQueue.push(DeleteJob{ id });
-		}
-		return;
-	}
-	// 1. 공격요청
-	g_Members[id]._act = ACT_ATT2;
-	g_Members[id]._dir = packet->_dir;
-	g_Members[id]._x = packet->_x;
-	g_Members[id]._y = packet->_y;
-
-	// 2. broadcast
-	char req_packet[sizeof(Header) + sizeof(ServerRequestAtt2)];
-	ZeroMemory(req_packet, sizeof(Header) + sizeof(ServerRequestAtt2));
-	Header* h = (Header*)req_packet;
-	h->byCode = 0x89;
-	h->bySize = sizeof(ServerRequestAtt2);
-	h->byType = dfPACKET_SC_ATTACK2;
-
-	ServerRequestAtt2* payload = (ServerRequestAtt2*)(req_packet + sizeof(Header));
-	payload->_dir = packet->_dir;
-	payload->_id = id;
-	payload->_x = packet->_x;
-	payload->_y = packet->_y;
-	SendBroadcast(wset, id, req_packet, sizeof(Header) + sizeof(ServerRequestAtt2));
-}
-
-void Attack3(FD_SET& wset, int id, ClientRequestAtt3* packet)
-{
-	// 0. 방향검사
-	if (packet->_dir != dfPACKET_MOVE_DIR_LL && packet->_dir != dfPACKET_MOVE_DIR_RR)
-	{
-		if (g_Members[id]._status == PS_VALID)
-		{
-			g_Members[id]._status = PS_INVALID;
-			g_DeleteQueue.push(DeleteJob{ id });
-		}
-		return;
-	}
-
-	// 1. 공격요청
-	g_Members[id]._act = ACT_ATT3;
-	g_Members[id]._dir = packet->_dir;
-	g_Members[id]._x = packet->_x;
-	g_Members[id]._y = packet->_y;
-
-	// 2. broadcast
-	char req_packet[sizeof(Header) + sizeof(ServerRequestAtt3)];
-	ZeroMemory(req_packet, sizeof(Header) + sizeof(ServerRequestAtt3));
-	Header* h = (Header*)req_packet;
-	h->byCode = 0x89;
-	h->bySize = sizeof(ServerRequestAtt3);
-	h->byType = dfPACKET_SC_ATTACK3;
-
-	ServerRequestAtt3* payload = (ServerRequestAtt3*)(req_packet + sizeof(Header));
-	payload->_dir = packet->_dir;
-	payload->_id = id;
-	payload->_x = packet->_x;
-	payload->_y = packet->_y;
-	SendBroadcast(wset, id, req_packet, sizeof(Header) + sizeof(ServerRequestAtt3));
-}
-
-void UpdateLogic(FD_SET& wset)
+void UpdateLogic()
 {
 	for (int i = 0; i < TOTAL_PLAYER;i++)
 	{
 		if (g_Members[i]._status != PS_VALID)
 			continue;
 
-		Player_Action act = g_Members[i]._act;
+		Player_Action act = g_Members[i]._player._act;
 		switch (act)
 		{
 		case ACT_MOVESTART:
-			g_Members[i]._act = ACT_MOVING;
+			g_Members[i]._player._act = ACT_MOVING;
 			break;
 		case ACT_MOVING:
 			MovingUpdate(i);
@@ -961,18 +649,16 @@ void UpdateLogic(FD_SET& wset)
 		case ACT_IDLE:
 			break;
 		case ACT_ATT1:
-			Att1Update(wset, i);
-			g_Members[i]._act = ACT_IDLE;
+			Att1Update(i);
+			g_Members[i]._player._act = ACT_IDLE;
 			break;
 		case ACT_ATT2:
-			// 임시. 반드시 수정.
-			Att1Update(wset, i);
-			g_Members[i]._act = ACT_IDLE;
+			Att2Update(i);
+			g_Members[i]._player._act = ACT_IDLE;
 			break;
 		case ACT_ATT3:
-			// 임시. 반드시 수정.
-			Att1Update(wset, i);
-			g_Members[i]._act = ACT_IDLE;
+			Att3Update(i);
+			g_Members[i]._player._act = ACT_IDLE;
 			break;
 		default:
 			// 로직상 불가, 서버의 실수
@@ -991,41 +677,41 @@ void UpdateLogic(FD_SET& wset)
 void MovingUpdate(int id)
 {
 	char ip_buffer[20];
-	switch (g_Members[id]._dir)
+	switch (g_Members[id]._player._dir)
 	{
 	case dfPACKET_MOVE_DIR_LL:
-		g_Members[id]._x -= 3;
+		g_Members[id]._player._x -= 3;
 		break;
 	case dfPACKET_MOVE_DIR_LU:
-		g_Members[id]._x -= 3;
-		g_Members[id]._y -= 2;
+		g_Members[id]._player._x -= 3;
+		g_Members[id]._player._y -= 2;
 		break;
 	case dfPACKET_MOVE_DIR_UU:
-		g_Members[id]._y -= 2;
+		g_Members[id]._player._y -= 2;
 		break;
 	case dfPACKET_MOVE_DIR_RU:
-		g_Members[id]._x += 3;
-		g_Members[id]._y -= 2;
+		g_Members[id]._player._x += 3;
+		g_Members[id]._player._y -= 2;
 		break;
 	case dfPACKET_MOVE_DIR_RR:
-		g_Members[id]._x += 3;
+		g_Members[id]._player._x += 3;
 		break;
 	case dfPACKET_MOVE_DIR_RD:
-		g_Members[id]._x += 3;
-		g_Members[id]._y += 2;
+		g_Members[id]._player._x += 3;
+		g_Members[id]._player._y += 2;
 		break;
 	case dfPACKET_MOVE_DIR_DD:
-		g_Members[id]._y += 2;
+		g_Members[id]._player._y += 2;
 		break;
 	case dfPACKET_MOVE_DIR_LD:
-		g_Members[id]._x -= 3;
-		g_Members[id]._y += 2;
+		g_Members[id]._player._x -= 3;
+		g_Members[id]._player._y += 2;
 		break;
 	default:
 		// 헤더 이상
 		InetNtopA(AF_INET, &g_Members[id].addr.sin_addr, ip_buffer, sizeof ip_buffer);
 		cout << "[Abnormal] " << ip_buffer << ":" << ntohs(g_Members[id].addr.sin_port) <<
-			"MovingDirError : " << g_Members[id]._dir << endl << endl;
+			"MovingDirError : " << g_Members[id]._player._dir << endl << endl;
 
 		if (g_Members[id]._status == PS_VALID)
 		{
@@ -1034,33 +720,35 @@ void MovingUpdate(int id)
 		}
 	}
 
-	if (g_Members[id]._x < dfRANGE_MOVE_LEFT)
+	if (g_Members[id]._player._x < dfRANGE_MOVE_LEFT)
 	{
-		g_Members[id]._x = dfRANGE_MOVE_LEFT;
+		g_Members[id]._player._x = dfRANGE_MOVE_LEFT;
 	}
-	else if (g_Members[id]._x > dfRANGE_MOVE_RIGHT)
+	else if (g_Members[id]._player._x > dfRANGE_MOVE_RIGHT)
 	{
-		g_Members[id]._x = dfRANGE_MOVE_RIGHT;
+		g_Members[id]._player._x = dfRANGE_MOVE_RIGHT;
 	}
-	else if (g_Members[id]._y < dfRANGE_MOVE_TOP)
+	else if (g_Members[id]._player._y < dfRANGE_MOVE_TOP)
 	{
-		g_Members[id]._y = dfRANGE_MOVE_TOP;
+		g_Members[id]._player._y = dfRANGE_MOVE_TOP;
 	}
-	else if (g_Members[id]._y > dfRANGE_MOVE_BOTTOM)
+	else if (g_Members[id]._player._y > dfRANGE_MOVE_BOTTOM)
 	{
-		g_Members[id]._y = dfRANGE_MOVE_BOTTOM;
+		g_Members[id]._player._y = dfRANGE_MOVE_BOTTOM;
 	}
 }
 
 // 프레임 처리해야 판정됨.
-void Att1Update(FD_SET& wset, int id)
+void Att1Update(int id)
 {
+	Proxy proxy;
+
 	// 방향이상 검사.
-	if (g_Members[id]._dir != dfPACKET_MOVE_DIR_LL && g_Members[id]._dir != dfPACKET_MOVE_DIR_RR)
+	if (g_Members[id]._player._dir != dfPACKET_MOVE_DIR_LL && g_Members[id]._player._dir != dfPACKET_MOVE_DIR_RR)
 	{
 		char err_buff[100];
-		sprintf_s(err_buff, sizeof err_buff, "att1 id : %d님의 방향 이상. (%d).", id, g_Members[id]._dir);
-		WriteLog(err_buff);
+		sprintf_s(err_buff, sizeof err_buff, "%d님의 방향 이상. (%d).", id, g_Members[id]._player._dir);
+		WriteLog(err_buff,getStackTrace(1).c_str());
 
 		if (g_Members[id]._status == PS_VALID)
 		{
@@ -1079,30 +767,30 @@ void Att1Update(FD_SET& wset, int id)
 	int range_y_max;
 
 
-	if (g_Members[id]._dir == dfPACKET_MOVE_DIR_LL)
+	if (g_Members[id]._player._dir == dfPACKET_MOVE_DIR_LL)
 	{
-		range_x_max = g_Members[id]._x;
-		range_x_min = g_Members[id]._x - 70;
-		range_y_max = g_Members[id]._y;
-		range_y_min = g_Members[id]._y - 100;
+		range_x_max = g_Members[id]._player._x;
+		range_x_min = g_Members[id]._player._x - 70;
+		range_y_max = g_Members[id]._player._y;
+		range_y_min = g_Members[id]._player._y - 100;
 	}
 	else
 	{
-		range_x_max = g_Members[id]._x + 70;
-		range_x_min = g_Members[id]._x;
-		range_y_max = g_Members[id]._y;
-		range_y_min = g_Members[id]._y - 100;
+		range_x_max = g_Members[id]._player._x + 70;
+		range_x_min = g_Members[id]._player._x;
+		range_y_max = g_Members[id]._player._y;
+		range_y_min = g_Members[id]._player._y - 100;
 	}
 
 	for (int i = 0;i < TOTAL_PLAYER;i++)
 	{
 		if (g_Members[i]._status == PS_VALID && i != id)
 		{
-			if (g_Members[i]._x >= range_x_min && g_Members[i]._x <= range_x_max &&
-				g_Members[i]._y >= range_y_min && g_Members[i]._y <= range_y_max)
+			if (g_Members[i]._player._x >= range_x_min && g_Members[i]._player._x <= range_x_max &&
+				g_Members[i]._player._y >= range_y_min && g_Members[i]._player._y <= range_y_max)
 			{
-				g_Members[i]._hp -= 10;
-				if (g_Members[i]._hp <= 0)
+				g_Members[i]._player._hp -= 10;
+				if (g_Members[i]._player._hp <= 0)
 				{
 					cout << i << "님 사망." << endl;
 					if (g_Members[i]._status == PS_VALID)
@@ -1113,26 +801,162 @@ void Att1Update(FD_SET& wset, int id)
 				}
 
 				// 데미지 계산
-				char req_packet[sizeof(Header) + sizeof(ServerRequestDamageStep)];
-				ZeroMemory(req_packet, sizeof(Header) + sizeof(ServerRequestDamageStep));
-				Header* h = (Header*)req_packet;
-				h->byCode = 0x89;
-				h->bySize = sizeof(ServerRequestDamageStep);
-				h->byType = dfPACKET_SC_DAMAGE;
-				ServerRequestDamageStep* payload = (ServerRequestDamageStep*)(req_packet + sizeof(Header));
-				payload->_id_attacker = id;
-				payload->_id_defender = i;
-				payload->_hp_defender = g_Members[i]._hp;
-
-				if (g_Members[i]._hp > 0)
+				
+				if (g_Members[i]._player._hp > 0)
 				{
-					SendUnicast(wset, i, req_packet, sizeof(Header) + sizeof(ServerRequestDamageStep));
+					proxy.ServerReqDamage(i, SENDMODE_UNI, id, i, g_Members[i]._player._hp);
 				}
-
-				SendBroadcast(wset, i, req_packet, sizeof(Header) + sizeof(ServerRequestDamageStep));
+				proxy.ServerReqDamage(i, SENDMODE_BROAD, id, i, g_Members[i]._player._hp);
 				//break;
 			}
 		}
 	}
 }
 
+void Att2Update(int id)
+{
+	Proxy proxy;
+
+	// 방향이상 검사.
+	if (g_Members[id]._player._dir != dfPACKET_MOVE_DIR_LL && g_Members[id]._player._dir != dfPACKET_MOVE_DIR_RR)
+	{
+		char err_buff[100];
+		sprintf_s(err_buff, sizeof err_buff, "%d님의 방향 이상. (%d).", id, g_Members[id]._player._dir);
+		WriteLog(err_buff, getStackTrace(1).c_str());
+
+		if (g_Members[id]._status == PS_VALID)
+		{
+			g_Members[id]._status = PS_INVALID;
+			g_DeleteQueue.push(DeleteJob{ id });
+		}
+		return;
+	}
+
+	// 직사각형의 좌 상단 꼭짓점.
+	int range_x_min;
+	int range_y_min;
+
+	// 직사각형의 우 하단 꼭짓점.
+	int range_x_max;
+	int range_y_max;
+
+
+	if (g_Members[id]._player._dir == dfPACKET_MOVE_DIR_LL)
+	{
+		range_x_max = g_Members[id]._player._x;
+		range_x_min = g_Members[id]._player._x - 70;
+		range_y_max = g_Members[id]._player._y;
+		range_y_min = g_Members[id]._player._y - 100;
+	}
+	else
+	{
+		range_x_max = g_Members[id]._player._x + 70;
+		range_x_min = g_Members[id]._player._x;
+		range_y_max = g_Members[id]._player._y;
+		range_y_min = g_Members[id]._player._y - 100;
+	}
+
+	for (int i = 0;i < TOTAL_PLAYER;i++)
+	{
+		if (g_Members[i]._status == PS_VALID && i != id)
+		{
+			if (g_Members[i]._player._x >= range_x_min && g_Members[i]._player._x <= range_x_max &&
+				g_Members[i]._player._y >= range_y_min && g_Members[i]._player._y <= range_y_max)
+			{
+				g_Members[i]._player._hp -= 10;
+				if (g_Members[i]._player._hp <= 0)
+				{
+					cout << i << "님 사망." << endl;
+					if (g_Members[i]._status == PS_VALID)
+					{
+						g_Members[i]._status = PS_INVALID;
+						g_DeleteQueue.push(DeleteJob{ i });
+					}
+				}
+
+				// 데미지 계산
+
+				if (g_Members[i]._player._hp > 0)
+				{
+					proxy.ServerReqDamage(i, SENDMODE_UNI, id, i, g_Members[i]._player._hp);
+				}
+				proxy.ServerReqDamage(i, SENDMODE_BROAD, id, i, g_Members[i]._player._hp);
+				//break;
+			}
+		}
+	}
+}
+
+void Att3Update(int id)
+{
+	Proxy proxy;
+
+	// 방향이상 검사.
+	if (g_Members[id]._player._dir != dfPACKET_MOVE_DIR_LL && g_Members[id]._player._dir != dfPACKET_MOVE_DIR_RR)
+	{
+		char err_buff[100];
+		sprintf_s(err_buff, sizeof err_buff, "%d님의 방향 이상. (%d).", id, g_Members[id]._player._dir);
+		WriteLog(err_buff, getStackTrace(1).c_str());
+
+		if (g_Members[id]._status == PS_VALID)
+		{
+			g_Members[id]._status = PS_INVALID;
+			g_DeleteQueue.push(DeleteJob{ id });
+		}
+		return;
+	}
+
+	// 직사각형의 좌 상단 꼭짓점.
+	int range_x_min;
+	int range_y_min;
+
+	// 직사각형의 우 하단 꼭짓점.
+	int range_x_max;
+	int range_y_max;
+
+
+	if (g_Members[id]._player._dir == dfPACKET_MOVE_DIR_LL)
+	{
+		range_x_max = g_Members[id]._player._x;
+		range_x_min = g_Members[id]._player._x - 70;
+		range_y_max = g_Members[id]._player._y;
+		range_y_min = g_Members[id]._player._y - 100;
+	}
+	else
+	{
+		range_x_max = g_Members[id]._player._x + 70;
+		range_x_min = g_Members[id]._player._x;
+		range_y_max = g_Members[id]._player._y;
+		range_y_min = g_Members[id]._player._y - 100;
+	}
+
+	for (int i = 0;i < TOTAL_PLAYER;i++)
+	{
+		if (g_Members[i]._status == PS_VALID && i != id)
+		{
+			if (g_Members[i]._player._x >= range_x_min && g_Members[i]._player._x <= range_x_max &&
+				g_Members[i]._player._y >= range_y_min && g_Members[i]._player._y <= range_y_max)
+			{
+				g_Members[i]._player._hp -= 10;
+				if (g_Members[i]._player._hp <= 0)
+				{
+					cout << i << "님 사망." << endl;
+					if (g_Members[i]._status == PS_VALID)
+					{
+						g_Members[i]._status = PS_INVALID;
+						g_DeleteQueue.push(DeleteJob{ i });
+					}
+				}
+
+				// 데미지 계산
+
+				if (g_Members[i]._player._hp > 0)
+				{
+					proxy.ServerReqDamage(i, SENDMODE_UNI, id, i, g_Members[i]._player._hp);
+				}
+				proxy.ServerReqDamage(i, SENDMODE_BROAD, id, i, g_Members[i]._player._hp);
+				//break;
+			}
+		}
+	}
+}

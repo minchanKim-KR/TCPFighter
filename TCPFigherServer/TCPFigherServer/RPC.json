@@ -1,0 +1,169 @@
+{
+    "HeaderOption": {
+        "HeaderCode": "0x89"
+    },
+    "Functions": [
+        {
+            "ServerReqCreateMyCharacter": {
+                "type": "dfPACKET_SC_CREATE_MY_CHARACTER",
+                "return": "int",
+                "params": [
+                    { "id": "int" },
+                    { "dir": "BYTE" },
+                    { "x": "short" },
+                    { "y": "short" },
+                    { "hp": "BYTE" }
+                ]
+            }
+        },
+        {
+            "ServerReqCreateOtherCharacter": {
+                "type": "dfPACKET_SC_CREATE_OTHER_CHARACTER",
+                "return": "int",
+                "params": [
+                    { "id": "int" },
+                    { "dir": "BYTE" },
+                    { "x": "short" },
+                    { "y": "short" },
+                    { "hp": "BYTE" }
+                ]
+            }
+        },
+        {
+            "ServerReqDeleteCharacter": {
+                "type": "dfPACKET_SC_DELETE_CHARACTER",
+                "return": "int",
+                "params": [
+                    { "id": "int" }
+                ]
+            }
+        },
+        {
+            "ClientReqMoveStart": {
+                "type": "dfPACKET_CS_MOVE_START",
+                "return": "int",
+                "params": [
+                    { "dir": "BYTE" },
+                    { "x": "short" },
+                    { "y": "short" }
+                ]
+            }
+        },
+        {
+            "ServerReqMoveStart": {
+                "type": "dfPACKET_SC_MOVE_START",
+                "return": "int",
+                "params": [
+                    { "id": "int" },
+                    { "dir": "BYTE" },
+                    { "x": "short" },
+                    { "y": "short" }
+                ]
+            }
+        },
+        {
+            "ClientReqMoveStop": {
+                "type": "dfPACKET_CS_MOVE_STOP",
+                "return": "int",
+                "params": [
+                    { "dir": "BYTE" },
+                    { "x": "short" },
+                    { "y": "short" }
+                ]
+            }
+        },
+        {
+            "ServerReqMoveStop": {
+                "type": "dfPACKET_SC_MOVE_STOP",
+                "return": "int",
+                "params": [
+                    { "id": "int" },
+                    { "dir": "BYTE" },
+                    { "x": "short" },
+                    { "y": "short" }
+                ]
+            }
+        },
+        {
+            "ClientReqAttack1": {
+                "type": "dfPACKET_CS_ATTACK1",
+                "return": "int",
+                "params": [
+                    { "dir": "BYTE" },
+                    { "x": "short" },
+                    { "y": "short" }
+                ]
+            }
+        },
+        {
+            "ServerReqAttack1": {
+                "type": "dfPACKET_SC_ATTACK1",
+                "return": "int",
+                "params": [
+                    { "id": "int" },
+                    { "dir": "BYTE" },
+                    { "x": "short" },
+                    { "y": "short" }
+                ]
+            }
+        },
+        {
+            "ClientReqAttack2": {
+                "type": "dfPACKET_CS_ATTACK2",
+                "return": "int",
+                "params": [
+                    { "dir": "BYTE" },
+                    { "x": "short" },
+                    { "y": "short" }
+                ]
+            }
+        },
+        {
+            "ServerReqAttack2": {
+                "type": "dfPACKET_SC_ATTACK2",
+                "return": "int",
+                "params": [
+                    { "id": "int" },
+                    { "dir": "BYTE" },
+                    { "x": "short" },
+                    { "y": "short" }
+                ]
+            }
+        },
+        {
+            "ClientReqAttack3": {
+                "type": "dfPACKET_CS_ATTACK3",
+                "return": "int",
+                "params": [
+                    { "dir": "BYTE" },
+                    { "x": "short" },
+                    { "y": "short" }
+                ]
+            }
+        },
+        {
+            "ServerReqAttack3": {
+                "type": "dfPACKET_SC_ATTACK3",
+                "return": "int",
+                "params": [
+                    { "id": "int" },
+                    { "dir": "BYTE" },
+                    { "x": "short" },
+                    { "y": "short" }
+                ]
+            }
+        },
+        {
+            "ServerReqDamage": {
+                "type": "dfPACKET_SC_DAMAGE",
+                "return": "int",
+                "params": [
+                    { "idAttacker": "int" },
+                    { "idDefender": "int" },
+                    { "hpDefender": "BYTE" }
+                ]
+            }
+        }
+
+    ]
+}

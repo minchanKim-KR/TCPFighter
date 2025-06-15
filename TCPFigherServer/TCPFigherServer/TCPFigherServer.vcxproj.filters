@@ -13,27 +13,87 @@
       <UniqueIdentifier>{67DA6AB6-F800-4c08-8B7A-83BB121AAD01}</UniqueIdentifier>
       <Extensions>rc;ico;cur;bmp;dlg;rc2;rct;bin;rgs;gif;jpg;jpeg;jpe;resx;tiff;tif;png;wav;mfcribbon-ms</Extensions>
     </Filter>
+    <Filter Include="헤더 파일\Utils">
+      <UniqueIdentifier>{67db1601-9e74-48b4-b55d-cb2e14e83b25}</UniqueIdentifier>
+    </Filter>
+    <Filter Include="헤더 파일\Buffer">
+      <UniqueIdentifier>{089932bd-ad35-4fe1-a6ed-4ae15fb298ed}</UniqueIdentifier>
+    </Filter>
+    <Filter Include="헤더 파일\RPC">
+      <UniqueIdentifier>{b687785e-00da-4054-97f5-35fbe56c75fc}</UniqueIdentifier>
+    </Filter>
+    <Filter Include="소스 파일\RPC">
+      <UniqueIdentifier>{ba6ecf7d-257a-4772-8e12-80958af10cce}</UniqueIdentifier>
+    </Filter>
+    <Filter Include="헤더 파일\PacketDefines">
+      <UniqueIdentifier>{2abba5c5-fd13-4776-b7cc-c0eb94ef0822}</UniqueIdentifier>
+    </Filter>
+    <Filter Include="소스 파일\Utils">
+      <UniqueIdentifier>{6ff71526-830d-4e7b-9b3f-beb277119b06}</UniqueIdentifier>
+    </Filter>
   </ItemGroup>
   <ItemGroup>
     <ClCompile Include="main.cpp">
       <Filter>소스 파일</Filter>
     </ClCompile>
-    <ClCompile Include="WriteLogTXT.cpp">
+    <ClCompile Include="SendPacket.cpp">
       <Filter>소스 파일</Filter>
+    </ClCompile>
+    <ClCompile Include="Session.cpp">
+      <Filter>소스 파일</Filter>
+    </ClCompile>
+    <ClCompile Include="Stub.cpp">
+      <Filter>소스 파일\RPC</Filter>
+    </ClCompile>
+    <ClCompile Include="Proxy.cpp">
+      <Filter>소스 파일\RPC</Filter>
+    </ClCompile>
+    <ClCompile Include="PrintStackInfo.cpp">
+      <Filter>소스 파일\Utils</Filter>
+    </ClCompile>
+    <ClCompile Include="WriteLogTXT.cpp">
+      <Filter>소스 파일\Utils</Filter>
+    </ClCompile>
+    <ClCompile Include="StubHandler.cpp">
+      <Filter>소스 파일\RPC</Filter>
     </ClCompile>
   </ItemGroup>
   <ItemGroup>
-    <ClInclude Include="RingBuffer.h">
+    <ClInclude Include="SendPacket.h">
       <Filter>헤더 파일</Filter>
     </ClInclude>
-    <ClInclude Include="WriteLogTXT.h">
+    <ClInclude Include="Session.h">
       <Filter>헤더 파일</Filter>
+    </ClInclude>
+    <ClInclude Include="RingBuffer.h">
+      <Filter>헤더 파일\Buffer</Filter>
+    </ClInclude>
+    <ClInclude Include="Proxy.h">
+      <Filter>헤더 파일\RPC</Filter>
+    </ClInclude>
+    <ClInclude Include="Stub.h">
+      <Filter>헤더 파일\RPC</Filter>
     </ClInclude>
     <ClInclude Include="PacketDefine.h">
-      <Filter>헤더 파일</Filter>
+      <Filter>헤더 파일\PacketDefines</Filter>
+    </ClInclude>
+    <ClInclude Include="PacketHeader.h">
+      <Filter>헤더 파일\PacketDefines</Filter>
+    </ClInclude>
+    <ClInclude Include="PrintStackInfo.h">
+      <Filter>헤더 파일\Utils</Filter>
+    </ClInclude>
+    <ClInclude Include="StubHandler.h">
+      <Filter>헤더 파일\RPC</Filter>
+    </ClInclude>
+    <ClInclude Include="WriteLogTXT.h">
+      <Filter>헤더 파일\Utils</Filter>
     </ClInclude>
     <ClInclude Include="NetworkPacket.h">
-      <Filter>헤더 파일</Filter>
+      <Filter>헤더 파일\PacketDefines</Filter>
+    </ClInclude>
+    <ClInclude Include="SerializingBuffer.h">
+      <Filter>헤더 파일\Buffer</Filter>
     </ClInclude>
   </ItemGroup>
 </Project>
